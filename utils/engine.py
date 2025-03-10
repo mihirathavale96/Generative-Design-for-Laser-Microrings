@@ -65,7 +65,7 @@ class GaussianDiffusionTrainer(nn.Module):
 		params_t = params_signal_rate * params_0 + params_noise_rate * params_noise
 		
 		# Predict noise of image, params and prop
-		img_pred, params_pred = self.model(x_t, t, params_t)
+		img_pred, params_pred = self.model(x_t, params_t, t)
 		
 		# Calculate loss for image, parameters and prop
 		img_loss = F.mse_loss(img_pred, img_noise, reduction="none")
@@ -130,7 +130,7 @@ class EnergyTrainer(nn.Module):
 		prop_t = prop_signal_rate * prop_0 + prop_noise_rate * prop_noise
 		
 		# Predict noise of property
-		prop_pred = self.model(x_t, t, params_t)
+		prop_pred = self.model(x_t, params_t, t)
 		
 		prop_loss = F.mse_loss(prop_pred, prop_t, reduction="none")
 		prop_loss = torch.sum(prop_loss)
@@ -162,7 +162,7 @@ class DDPMSampler(nn.Module):
 		Calculate the mean and variance for both image and parameters
 		"""
 		# Predict noise for both image and parameters
-		img_noise_pred, params_noise_pred, prop_noise_pred = self.model(x_t, t, params_t)
+		img_noise_pred, params_noise_pred = self.model(x_t, t, params_t)
 		
 		# Calculate mean and variance for image
 		img_mean = extract(self.coeff_1, t, x_t.shape) * x_t - extract(self.coeff_2, t, x_t.shape) * img_noise_pred
