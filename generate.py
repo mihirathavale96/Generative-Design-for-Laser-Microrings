@@ -23,7 +23,7 @@ def parse_option():
 	parser.add_argument("-bs", "--batch_size", type=int, default=16)
 	
 	# sampler param
-	parser.add_argument("--result_only", default=True, action="store_true")
+	parser.add_argument("--result_only", default=False, action="store_true")
 	parser.add_argument("--interval", type=int, default=50)
 	
 	# DDIM sampler param
@@ -33,9 +33,7 @@ def parse_option():
 	
 	# save image param
 	parser.add_argument("--nrow", type=int, default=4)
-	parser.add_argument("--show", default=False, action="store_true")
-	parser.add_argument("-sp", "--image_save_path", type=str, default=None)
-	parser.add_argument("--to_grayscale", default=False, action="store_true")
+	parser.add_argument("-sp", "--save_path", type=str, default="results/")
 	
 	args = parser.parse_args()
 	return args
@@ -66,7 +64,7 @@ def save_sample_image(images: torch.Tensor, result_only, nrow, **kwargs):
 		grid = grid.repeat(3, 1, 1)
 	grid_image = transforms.ToPILImage()(grid)
 	
-	grid_image.save("samples.png")
+	grid_image.save(args.save_path+"samples.png")
 
 
 @torch.no_grad()
@@ -97,8 +95,10 @@ def generate(args):
 	extra_param = dict(steps=args.steps, eta=args.eta, method=args.method)
 
 	images, params = sampler(z_t, z_params, only_return_x_0=args.result_only, interval=args.interval, **extra_param)
-	
+
 	save_sample_image(images, result_only=args.result_only, nrow=args.nrow)
+
+	
 	
 
 if __name__ == "__main__":

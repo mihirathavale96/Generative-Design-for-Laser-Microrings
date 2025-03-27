@@ -2,17 +2,18 @@ import numpy as np
 import torch
 import pandas as pd
 
-from pathlib import Path
-import joblib
-from argparse import ArgumentParser
-
 from utils.tools import load_yaml
 from utils.engine import DDPMSampler, DDIMSampler
 from model.UNet import UNet
+import torch
+from argparse import ArgumentParser
 
 from torchvision.utils import make_grid
 from torchvision import transforms
 from PIL import Image
+
+from pathlib import Path
+import joblib
 
 from torchmetrics.image.fid import FrechetInceptionDistance
 
@@ -20,16 +21,16 @@ def parse_option():
 	parser = ArgumentParser()
 	parser.add_argument("-cp_uncond", "--checkpoint_path_uncond", type=str, default="checkpoint/ddim_uncond.pth")
 	parser.add_argument("-cp_energy", "--checkpoint_path_energy", type=str, default="checkpoint/ddim_energy.pth")
-	parser.add_argument("-sp_param", "--scaler_path_param", type=str, default="checkpoint/param_scaler.pth")
-	parser.add_argument("-sp_prop", "--scaler_path_prop", type=str, default="checkpoint/prop_scaler.pth")
+	parser.add_argument("-sp_param", "--scaler_path_param", type=str, default="checkpoint/param_scaler.pkl")
+	parser.add_argument("-sp_prop", "--scaler_path_prop", type=str, default="checkpoint/prop_scaler.pkl")
 	parser.add_argument("-dp", "--dataset_path", type=str, default="dataset/images_crop_only.pkl")
 	
 	parser.add_argument("--device", type=str, default="cuda")
 	parser.add_argument("--sampler", type=str, default="ddim", choices=["ddpm", "ddim"])
 	
 	# generator param
-	parser.add_argument("-bs", "--batch_size", type=int, default=16)
-	parser.add_argument("-nb", "--num_batch", type=int, default=3)
+	parser.add_argument("-bs", "--batch_size", type=int, default=64)
+	parser.add_argument("-nb", "--num_batch", type=int, default=38)
 	
 	# sampler param
 	parser.add_argument("--interval", type=int, default=50)
@@ -38,6 +39,8 @@ def parse_option():
 	parser.add_argument("--eta", type=float, default=0.0)
 	parser.add_argument("--steps", type=int, default=100)
 	parser.add_argument("--method", type=str, default="linear", choices=["linear", "quadratic"])
+
+	parser.add_argument("-sp", "--save_path", type=str, default="results/")
 	
 	args = parser.parse_args()
 	return args
@@ -54,6 +57,8 @@ def generate(args):
 	model = UNet(**config["Model"]).to(device)
 	model.load_state_dict(cp["model"])
 	model = model.eval()
+
+	params_scaler = joblib.load(args.scaler_path_param)
 	
 	if args.sampler == "ddim":
 		sampler = DDIMSampler(model, **cp["config"]["Trainer"]).to(device)
@@ -64,8 +69,8 @@ def generate(args):
 	
 	extra_param = dict(steps=args.steps, eta=args.eta, method=args.method)
 	
-	generated_images = []
-	#generated_params = []
+	#generated_images = []
+	generated_params = []
 	
 	for _ in range(args.num_batch):
 		z_t = torch.randn((args.batch_size, cp["config"]["Model"]["in_channels"],
@@ -76,26 +81,33 @@ def generate(args):
 		images, params = sampler(z_t, z_params, only_return_x_0=True, interval=args.interval, **extra_param)
 		
 		# Process images to [0, 255] uint8
-		images = (images * 0.5 + 0.5).clamp(0, 1)
-		images = (images * 255).type(torch.uint8).cpu().numpy()
-		generated_images.append(images.squeeze(1))  # Remove channel dim
+		#images = (images * 0.5 + 0.5).clamp(0, 1)
+		#images = (images * 255).type(torch.uint8).cpu().numpy()
+		#generated_images.append(images.squeeze(1))  # Remove channel dim
 		
 		# Inverse transform parameters
-		#params = params.cpu().numpy()
-		#params_original = params_scaler.inverse_transform(params)
-		#generated_params.append(params_original)
+		params = params.cpu().numpy()
+		params_original = params_scaler.inverse_transform(params)
+		generated_params.append(params_original)
 	
-	generated_images = np.concatenate(generated_images)
-	#generated_params = np.concatenate(generated_params)
+	#generated_images = np.concatenate(generated_images)
+	generated_params = np.concatenate(generated_params)
+	
+	columns = ['diameter', 'pitch', 'height', 'nQWs', 'growth_Temp_QW',
+            'growth_AsP_QW', 'growth_InP_barrier', 'growth_time_cap']
+
+	df_gen = pd.DataFrame(generated_params, columns=columns)
+	df_gen.to_pickle(args.save_path+"generated_params.pkl")
+	
 	
 	###################
 	# Load real data
 	df = pd.read_pickle(args.dataset_path)
-	real_images = np.stack([np.array(img) for img in df['binarized_cropped_optical_image']])
-	#real_params = df[['diameter', 'pitch', 'height', 'nQWs', 'growth_Temp_QW',
-	#                  'growth_AsP_QW', 'growth_InP_barrier', 'growth_time_cap']].values
+	#real_images = np.stack([np.array(img) for img in df['binarized_cropped_optical_image']])
+	#real_params = df[columns].values
 	
 	###################
+	'''
 	fid = FrechetInceptionDistance(normalize=True).to(device)
 	
 	# Convert to 3-channel and tensor [N, C, H, W]
@@ -109,6 +121,7 @@ def generate(args):
 	fid.update(gen_tensor, real=False)
 	fid_score = fid.compute().item()
 	print(f"{fid_score:.2f}")
+	'''
 
 if __name__ == "__main__":
     args = parse_option()
