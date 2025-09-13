@@ -4,7 +4,6 @@ from torch import nn
 from torch.nn import init
 from torch.nn import functional as F
 from abc import ABC, abstractmethod
-import warnings
 
 
 # use sinusoidal position embedding to encode time step (https://arxiv.org/abs/1706.03762)
@@ -103,9 +102,9 @@ class ResidualBlock(TimestepBlock):
         return h + self.shortcut(x)
 
 
-# Attention block with shortcut - IMPROVED with dropout
+# Attention block with shortcut
 class AttentionBlock(nn.Module):
-    def __init__(self, channels, num_heads=1, dropout=0.1):
+    def __init__(self, channels, num_heads=1):
         super().__init__()
         self.num_heads = num_heads
         assert channels % num_heads == 0
@@ -113,43 +112,37 @@ class AttentionBlock(nn.Module):
         self.norm = norm_layer(channels)
         self.qkv = nn.Conv2d(channels, channels * 3, kernel_size=1, bias=False)
         self.proj = nn.Conv2d(channels, channels, kernel_size=1)
-        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         B, C, H, W = x.shape
         qkv = self.qkv(self.norm(x))
         q, k, v = qkv.reshape(B * self.num_heads, -1, H * W).chunk(3, dim=1)
-        # FIXED: Use standard sqrt scaling instead of double sqrt
-        scale = 1. / math.sqrt(C // self.num_heads)
+        scale = 1. / math.sqrt(math.sqrt(C // self.num_heads))
         attn = torch.einsum("bct,bcs->bts", q * scale, k * scale)
         attn = attn.softmax(dim=-1)
-        attn = self.dropout(attn)  # Added dropout for regularization
         h = torch.einsum("bts,bcs->bct", attn, v)
         h = h.reshape(B, -1, H, W)
         h = self.proj(h)
         return h + x
 
 
-# IMPROVED Cross-Modal Attention Block with richer parameter representation
+# Cross-Modal Attention Block for joint image-parameter diffusion
 class CrossModalAttentionBlock(nn.Module):
-    def __init__(self, img_channels, param_dim, num_heads=1, n_param_tokens=4, dropout=0.1):
+    def __init__(self, img_channels, param_dim, num_heads=1):
         super().__init__()
         self.num_heads = num_heads
-        self.n_param_tokens = n_param_tokens  # Multiple tokens for richer representation
         assert img_channels % num_heads == 0
         
         # Image feature processing
         self.img_norm = norm_layer(img_channels)
         self.img_to_q = nn.Conv2d(img_channels, img_channels, kernel_size=1, bias=False)
         
-        # Parameter processing with expanded representation
+        # Parameter processing
         self.param_norm = nn.LayerNorm(param_dim)
-        # Project parameters to multiple tokens
-        self.param_to_kv = nn.Linear(param_dim, img_channels * 2 * n_param_tokens)
+        self.param_to_kv = nn.Linear(param_dim, img_channels * 2)
         
         # Output projection
         self.proj = nn.Conv2d(img_channels, img_channels, kernel_size=1)
-        self.dropout = nn.Dropout(dropout)
         
     def forward(self, img, params):
         B, C, H, W = img.shape
@@ -159,21 +152,23 @@ class CrossModalAttentionBlock(nn.Module):
         q = self.img_to_q(img_norm)
         q = q.reshape(B * self.num_heads, C // self.num_heads, H * W)  # [B*nh, C/nh, H*W]
         
-        # Process parameters to create keys and values with multiple tokens
+        # Process parameters to create keys and values
         param_norm = self.param_norm(params)
-        kv = self.param_to_kv(param_norm)  # [B, C*2*n_tokens]
-        kv = kv.reshape(B, 2, C, self.n_param_tokens)  # [B, 2, C, n_tokens]
-        k, v = kv[:, 0], kv[:, 1]  # Each is [B, C, n_tokens]
+        kv = self.param_to_kv(param_norm)  # [B, img_channels*2]
+        k, v = kv.chunk(2, dim=1)
+        
+        # Reshape k, v for attention
+        k = k.unsqueeze(-1)  # [B, C, 1]
+        v = v.unsqueeze(-1)  # [B, C, 1]
         
         # Reshape for multi-head attention
-        k = k.reshape(B * self.num_heads, C // self.num_heads, self.n_param_tokens)
-        v = v.reshape(B * self.num_heads, C // self.num_heads, self.n_param_tokens)
+        k = k.reshape(B * self.num_heads, C // self.num_heads, 1)  # [B*nh, C/nh, 1]
+        v = v.reshape(B * self.num_heads, C // self.num_heads, 1)  # [B*nh, C/nh, 1]
         
-        # Cross-attention with proper scaling
-        scale = 1. / math.sqrt(C // self.num_heads)  # Fixed: standard sqrt scaling
-        attn = torch.einsum("bct,bcs->bts", q * scale, k * scale)  # [B*nh, H*W, n_tokens]
-        attn = attn.softmax(dim=-1)
-        attn = self.dropout(attn)  # Added dropout
+        # Cross-attention
+        scale = 1. / math.sqrt(math.sqrt(C // self.num_heads))
+        attn = torch.einsum("bct,bcs->bts", q * scale, k * scale)  # [B*nh, H*W, 1]
+        attn = attn.softmax(dim=1)
         
         # Apply attention weights
         h = torch.einsum("bts,bcs->bct", attn, v)  # [B*nh, C/nh, H*W]
@@ -255,9 +250,9 @@ class ObjectiveEncoder(nn.Module):
         return h
 
 
-# IMPROVED Parameter Encoder MLP with better feature extraction
+# Parameter Encoder MLP
 class ParameterEncoder(nn.Module):
-    def __init__(self, param_dim, hidden_dim, out_dim, time_dim, num_layers=3):
+    def __init__(self, param_dim, hidden_dim, out_dim, time_dim):
         super().__init__()
         self.time_embed = nn.Sequential(
             nn.Linear(time_dim, hidden_dim),
@@ -273,7 +268,7 @@ class ParameterEncoder(nn.Module):
                 nn.SiLU(),
                 nn.Linear(hidden_dim, hidden_dim)
             )
-            for _ in range(num_layers)
+            for _ in range(2)  # 3 layers of transformation
         ])
         
         self.out_proj = nn.Linear(hidden_dim, out_dim)
@@ -293,12 +288,11 @@ class ParameterEncoder(nn.Module):
         return self.out_proj(h)
 
 
-# IMPROVED Cross-Modal Attention Block with Objective Conditioning
+# Cross-Modal Attention Block with Objective Conditioning
 class CrossModalObjectiveAttentionBlock(nn.Module):
-    def __init__(self, img_channels, param_dim, obj_dim, num_heads=1, n_tokens=4, dropout=0.1):
+    def __init__(self, img_channels, param_dim, obj_dim, num_heads=1):
         super().__init__()
         self.num_heads = num_heads
-        self.n_tokens = n_tokens
         assert img_channels % num_heads == 0
         
         # Image feature processing
@@ -308,12 +302,10 @@ class CrossModalObjectiveAttentionBlock(nn.Module):
         # Combined parameter + objective processing
         combined_dim = param_dim + obj_dim
         self.combined_norm = nn.LayerNorm(combined_dim)
-        # Project to multiple tokens for richer representation
-        self.combined_to_kv = nn.Linear(combined_dim, img_channels * 2 * n_tokens)
+        self.combined_to_kv = nn.Linear(combined_dim, img_channels * 2)
         
         # Output projection
         self.proj = nn.Conv2d(img_channels, img_channels, kernel_size=1)
-        self.dropout = nn.Dropout(dropout)
         
     def forward(self, img, params, obj_emb):
         B, C, H, W = img.shape
@@ -327,18 +319,16 @@ class CrossModalObjectiveAttentionBlock(nn.Module):
         combined = torch.cat([params, obj_emb], dim=-1)
         combined_norm = self.combined_norm(combined)
         kv = self.combined_to_kv(combined_norm)
-        kv = kv.reshape(B, 2, C, self.n_tokens)
-        k, v = kv[:, 0], kv[:, 1]
+        k, v = kv.chunk(2, dim=1)
         
         # Reshape for attention
-        k = k.reshape(B * self.num_heads, C // self.num_heads, self.n_tokens)
-        v = v.reshape(B * self.num_heads, C // self.num_heads, self.n_tokens)
+        k = k.unsqueeze(-1).reshape(B * self.num_heads, C // self.num_heads, 1)
+        v = v.unsqueeze(-1).reshape(B * self.num_heads, C // self.num_heads, 1)
         
-        # Cross-attention with proper scaling
-        scale = 1. / math.sqrt(C // self.num_heads)  # Fixed: standard sqrt scaling
+        # Cross-attention
+        scale = 1. / math.sqrt(math.sqrt(C // self.num_heads))
         attn = torch.einsum("bct,bcs->bts", q * scale, k * scale)
-        attn = attn.softmax(dim=-1)
-        attn = self.dropout(attn)  # Added dropout
+        attn = attn.softmax(dim=1)
         
         h = torch.einsum("bts,bcs->bct", attn, v)
         h = h.reshape(B, C, H, W)
@@ -360,13 +350,17 @@ class TimestepEmbedSequentialWithObjective(nn.Sequential, TimestepBlock):
                 # This layer requires both params and obj_emb
                 if params is not None and obj_emb is not None:
                     x = layer(x, params, obj_emb)
-                elif params is not None or obj_emb is not None:
-                    # Log warning if only one input is provided
-                    warnings.warn("CrossModalObjectiveAttentionBlock received incomplete inputs")
+                else:
+                    # Apply identity transformation if inputs are missing
+                    # This maintains the residual connection behavior
+                    pass  # x remains unchanged (identity)
             elif isinstance(layer, CrossModalAttentionBlock):
                 # This layer requires params
                 if params is not None:
                     x = layer(x, params)
+                else:
+                    # Apply identity transformation if params are missing
+                    pass  # x remains unchanged (identity)
             elif isinstance(layer, TimestepBlock):
                 x = layer(x, emb)
             else:
@@ -403,27 +397,7 @@ class Downsample(nn.Module):
         return self.op(x)
 
 
-# NEW: Parameter Decoder that combines features from both modalities
-class ParameterDecoder(nn.Module):
-    def __init__(self, param_hidden_dim, img_channels, param_dim, hidden_dim=256):
-        super().__init__()
-        
-        # Combine features from both parameter encoder and image path
-        self.combine_features = nn.Sequential(
-            nn.Linear(param_hidden_dim + img_channels, hidden_dim),
-            nn.SiLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, param_dim)
-        )
-        
-    def forward(self, param_features, img_features_pooled):
-        combined = torch.cat([param_features, img_features_pooled], dim=1)
-        return self.combine_features(combined)
-
-
-# The IMPROVED UNet model with better cross-modal integration
+# The modified UNet model with classifier-free guidance conditioning
 class UNet(nn.Module):
 	def __init__(
 			self,
@@ -431,9 +405,9 @@ class UNet(nn.Module):
 			out_channels=1,
 			model_channels=128,
 			param_dim=8,
-			param_hidden_dim=128,
-			obj_dim=1,
-			obj_hidden_dim=64,
+			param_hidden_dim=64,
+			obj_dim=2, 
+			obj_hidden_dim=64, 
 			num_res_blocks=2,
 			attention_resolutions=(8, 16),
 			dropout=0.1,
@@ -441,9 +415,7 @@ class UNet(nn.Module):
 			conv_resample=True,
 			num_heads=4,
 			use_cross_attention=True,
-			use_objective_conditioning=True,
-			n_param_tokens=4,  # NEW: number of tokens for parameter representation
-			normalize_params=True  # NEW: whether to normalize parameters
+			use_objective_conditioning=True 
 	):
 		super().__init__()
 	
@@ -460,13 +432,6 @@ class UNet(nn.Module):
 		self.num_heads = num_heads
 		self.use_cross_attention = use_cross_attention
 		self.use_objective_conditioning = use_objective_conditioning
-		self.n_param_tokens = n_param_tokens
-		self.normalize_params = normalize_params
-	
-		# NEW: Parameter normalization for stable training
-		if normalize_params:
-			self.param_scale = nn.Parameter(torch.ones(param_dim))
-			self.param_shift = nn.Parameter(torch.zeros(param_dim))
 	
 		# time embedding
 		time_embed_dim = model_channels * 4
@@ -481,8 +446,7 @@ class UNet(nn.Module):
 			param_dim=param_dim,
 			hidden_dim=param_hidden_dim,
 			out_dim=param_hidden_dim,
-			time_dim=time_embed_dim,
-			num_layers=3
+			time_dim=time_embed_dim
 		)
 		
 		# Objective encoder for classifier-free guidance
@@ -510,21 +474,15 @@ class UNet(nn.Module):
 				]
 				ch = mult * model_channels
 				if ds in attention_resolutions:
-					# Add self-attention to images with dropout
-					layers.append(AttentionBlock(ch, num_heads=num_heads, dropout=dropout))
+					# Add self-attention to images
+					layers.append(AttentionBlock(ch, num_heads=num_heads))
 					
 					# Add cross-attention between image and parameter+objective modalities
 					if self.use_cross_attention:
 						if self.use_objective_conditioning:
-							layers.append(CrossModalObjectiveAttentionBlock(
-								ch, param_hidden_dim, obj_hidden_dim, 
-								num_heads=num_heads, n_tokens=n_param_tokens, dropout=dropout
-							))
+							layers.append(CrossModalObjectiveAttentionBlock(ch, param_hidden_dim, obj_hidden_dim, num_heads=num_heads))
 						else:
-							layers.append(CrossModalAttentionBlock(
-								ch, param_hidden_dim, 
-								num_heads=num_heads, n_param_tokens=n_param_tokens, dropout=dropout
-							))
+							layers.append(CrossModalAttentionBlock(ch, param_hidden_dim, num_heads=num_heads))
 						
 				self.down_blocks.append(TimestepEmbedSequentialWithObjective(*layers))
 				down_block_chans.append(ch)
@@ -536,21 +494,15 @@ class UNet(nn.Module):
 		# middle block
 		middle_layers = [
 			ResidualBlock(ch, ch, time_embed_dim, dropout),
-			AttentionBlock(ch, num_heads=num_heads, dropout=dropout)
+			AttentionBlock(ch, num_heads=num_heads)
 		]
 		
 		# Add a cross-attention block at the bottleneck
 		if self.use_cross_attention:
 			if self.use_objective_conditioning:
-				middle_layers.append(CrossModalObjectiveAttentionBlock(
-					ch, param_hidden_dim, obj_hidden_dim, 
-					num_heads=num_heads, n_tokens=n_param_tokens, dropout=dropout
-				))
+				middle_layers.append(CrossModalObjectiveAttentionBlock(ch, param_hidden_dim, obj_hidden_dim, num_heads=num_heads))
 			else:
-				middle_layers.append(CrossModalAttentionBlock(
-					ch, param_hidden_dim, 
-					num_heads=num_heads, n_param_tokens=n_param_tokens, dropout=dropout
-				))
+				middle_layers.append(CrossModalAttentionBlock(ch, param_hidden_dim, num_heads=num_heads))
 			
 		middle_layers.append(ResidualBlock(ch, ch, time_embed_dim, dropout))
 		
@@ -571,20 +523,14 @@ class UNet(nn.Module):
 				ch = model_channels * mult
 				if ds in attention_resolutions:
 					# Add self-attention to images
-					layers.append(AttentionBlock(ch, num_heads=num_heads, dropout=dropout))
+					layers.append(AttentionBlock(ch, num_heads=num_heads))
 					
 					# Add cross-attention between image and parameter+objective modalities
 					if self.use_cross_attention:
 						if self.use_objective_conditioning:
-							layers.append(CrossModalObjectiveAttentionBlock(
-								ch, param_hidden_dim, obj_hidden_dim,
-								num_heads=num_heads, n_tokens=n_param_tokens, dropout=dropout
-							))
+							layers.append(CrossModalObjectiveAttentionBlock(ch, param_hidden_dim, obj_hidden_dim, num_heads=num_heads))
 						else:
-							layers.append(CrossModalAttentionBlock(
-								ch, param_hidden_dim,
-								num_heads=num_heads, n_param_tokens=n_param_tokens, dropout=dropout
-							))
+							layers.append(CrossModalAttentionBlock(ch, param_hidden_dim, num_heads=num_heads))
 						
 				if level and i == num_res_blocks:
 					layers.append(Upsample(ch, conv_resample))
@@ -600,13 +546,8 @@ class UNet(nn.Module):
 			nn.Conv2d(model_channels, out_channels, kernel_size=3, padding=1),
 		)
 	
-		# IMPROVED: Parameter decoder that combines features from both paths
-		self.param_decoder = ParameterDecoder(
-			param_hidden_dim=param_hidden_dim,
-			img_channels=model_channels,  # ch at the end of up_blocks
-			param_dim=param_dim,
-			hidden_dim=256
-		)
+		# Parameter output projector
+		self.param_out = nn.Linear(param_hidden_dim, param_dim)
 	
 	def forward(self, x, params, timesteps, objectives=None, cfg_mask=None):
 		"""
@@ -621,10 +562,6 @@ class UNet(nn.Module):
 				- parameter noise prediction [N x param_dim]
 		"""
 		hs = []
-		
-		# NEW: Normalize parameters if enabled
-		if self.normalize_params:
-			params = (params - self.param_shift) / (self.param_scale + 1e-5)
 		
 		# Time step embedding
 		emb = self.time_embed(timestep_embedding(timesteps, self.model_channels))
@@ -653,14 +590,6 @@ class UNet(nn.Module):
 			
 		# Output projections
 		img_out = self.img_out(h)
-		
-		# IMPROVED: Combine features from both paths for parameter prediction
-		# Global average pooling on image features
-		img_features_pooled = h.mean(dim=[2, 3])  # [B, C]
-		param_out = self.param_decoder(param_features, img_features_pooled)
-		
-		# NEW: Denormalize parameter predictions if normalization was used
-		if self.normalize_params:
-			param_out = param_out * self.param_scale + self.param_shift
+		param_out = self.param_out(param_features)
 		
 		return img_out, param_out
