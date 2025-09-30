@@ -21,8 +21,13 @@ from sklearn.preprocessing import PowerTransformer, MinMaxScaler, StandardScaler
 class ImageDataset(Dataset):
 	def __init__(self, dataframe):
 		
-		self.images = [np.array(img, dtype=np.uint8) for img in dataframe['binarized_cropped_optical_image']]
-	
+		self.images = [np.array(img, dtype=np.uint8) for img in dataframe['processed_image']]
+
+		# because mihir made an error and gave me as a list, please remove for next version
+		for i, image in enumerate(self.images):
+			#image = 255 - image # flip
+			self.images[i] = np.squeeze(image)
+
 		self.transform = v2.Compose([
 			v2.RandomHorizontalFlip(p=0.5),
 			v2.RandomVerticalFlip(p=0.5),
@@ -31,9 +36,9 @@ class ImageDataset(Dataset):
 			v2.Normalize(mean=[0.5], std=[0.5]),    # Maps [0, 1] → [-1, 1]
 		])
 	
-		self.params = dataframe[['diameter', 'pitch', 'height', 'nQWs', 'growth_Temp_QW',
+		self.params = dataframe[['diameter', 'pitch', 'nQWs', 'growth_Temp_QW',
 								 'growth_AsP_QW', 'growth_InP_barrier', 'growth_time_cap']].values
-		self.prop = dataframe[['lasing_threshold']].values
+		self.prop = dataframe[['lasing_threshold_corrected', 'lasing_wl_corrected']].values
 		
 		self.params_scaler = MinMaxScaler(feature_range=(-1, 1))
 		self.prop_scaler = PowerTransformer()
@@ -42,33 +47,6 @@ class ImageDataset(Dataset):
 		return len(self.images)
 	
 	def preprocessing(self):
-		'''
-		for i in range(len(self.images)):
-			image = self.images[i]
-		
-			# Convert grayscale images to RGB by duplicating the single channel
-			if len(image.shape) == 2:  # If grayscale (only 1 channel)
-				image = np.stack([image] * 3, axis=-1)  # Duplicate the channel to form an RGB image
-	
-			# Convert to HSV using OpenCV
-			image = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
-	
-			# Extract the V (value) channel, which is the brightness channel
-			value_channel = image[:, :, 2]
-	
-			# Apply adaptive thresholding
-			# Use adaptiveThreshold with a mean value method, block size of 11, and a constant of 5
-			image = cv2.adaptiveThreshold(value_channel, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
-												cv2.THRESH_BINARY, 13, 6)
-	
-			# Normalize binary convention (ensure foreground is white and background dark)
-			#image = self.normalize_binary(image)
-	
-			# Convert binary back to a PIL Image for consistency
-			image = Image.fromarray(image)
-	
-			self.images_new.append(image)
-		   '''
 	
 		self.params_norm = self.params_scaler.fit_transform(self.params)
 		self.params_norm = torch.tensor(self.params_norm, dtype=torch.float32)
@@ -86,9 +64,9 @@ class ImageDataset(Dataset):
 		return image, param, prop
 	
 
-def create_dataset(batch_size, **kwargs):
+def create_dataset(batch_size, datafilepath, **kwargs):
 	path = Path.cwd()
-	df= pd.read_pickle(f'{path}/dataset/images_crop_only.pkl')
+	df= pd.read_pickle(f"{datafilepath}")
 	
 	dataset = ImageDataset(df)
 	dataset.preprocessing()
