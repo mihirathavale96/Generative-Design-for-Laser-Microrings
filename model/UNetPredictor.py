@@ -1,181 +1,43 @@
+# UNetPredictor.py
 import math
 import torch
 from torch import nn
-from torch.nn import init
 from torch.nn import functional as F
 
-
-# use GN for norm layer
+# -------------------------
+# Normalization helper
+# -------------------------
 def norm_layer(channels):
     return nn.GroupNorm(32, channels)
 
-
-# Standard Residual block (no time embedding)
+# -------------------------
+# Residual / Downsample blocks (without timestep embedding)
+# -------------------------
 class ResidualBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, dropout):
-        super().__init__()
-        self.conv1 = nn.Sequential(
-            norm_layer(in_channels),
-            nn.SiLU(),
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
-        )
+	def __init__(self, in_channels, out_channels, dropout, residual_scale=1.0):
+		super().__init__()
+		self.residual_scale = residual_scale
+		self.conv1 = nn.Sequential(
+			norm_layer(in_channels),
+			nn.SiLU(),
+			nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+		)
+		self.conv2 = nn.Sequential(
+			norm_layer(out_channels),
+			nn.SiLU(),
+			nn.Dropout(p=dropout),
+			nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+		)
+		if in_channels != out_channels:
+			self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+		else:
+			self.shortcut = nn.Identity()
+	
+	def forward(self, x):
+		h = self.conv1(x)
+		h = self.conv2(h)
+		return self.shortcut(x) + self.residual_scale * h
 
-        self.conv2 = nn.Sequential(
-            norm_layer(out_channels),
-            nn.SiLU(),
-            nn.Dropout(p=dropout),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
-        )
-
-        if in_channels != out_channels:
-            self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1)
-        else:
-            self.shortcut = nn.Identity()
-
-    def forward(self, x):
-        """
-        `x` has shape `[batch_size, in_dim, height, width]`
-        """
-        h = self.conv1(x)
-        h = self.conv2(h)
-        return h + self.shortcut(x)
-
-
-# Attention block with shortcut
-class AttentionBlock(nn.Module):
-    def __init__(self, channels, num_heads=1):
-        super().__init__()
-        self.num_heads = num_heads
-        assert channels % num_heads == 0
-
-        self.norm = norm_layer(channels)
-        self.qkv = nn.Conv2d(channels, channels * 3, kernel_size=1, bias=False)
-        self.proj = nn.Conv2d(channels, channels, kernel_size=1)
-
-    def forward(self, x):
-        B, C, H, W = x.shape
-        qkv = self.qkv(self.norm(x))
-        q, k, v = qkv.reshape(B * self.num_heads, -1, H * W).chunk(3, dim=1)
-        scale = 1. / math.sqrt(math.sqrt(C // self.num_heads))
-        attn = torch.einsum("bct,bcs->bts", q * scale, k * scale)
-        attn = attn.softmax(dim=-1)
-        h = torch.einsum("bts,bcs->bct", attn, v)
-        h = h.reshape(B, -1, H, W)
-        h = self.proj(h)
-        return h + x
-
-
-# Cross-Modal Attention Block for joint image-parameter processing
-class CrossModalAttentionBlock(nn.Module):
-    def __init__(self, img_channels, param_dim, num_heads=1):
-        super().__init__()
-        self.num_heads = num_heads
-        assert img_channels % num_heads == 0
-        
-        # Image feature processing
-        self.img_norm = norm_layer(img_channels)
-        self.img_to_q = nn.Conv2d(img_channels, img_channels, kernel_size=1, bias=False)
-        
-        # Parameter processing
-        self.param_norm = nn.LayerNorm(param_dim)
-        self.param_to_kv = nn.Linear(param_dim, img_channels * 2)
-        
-        # Output projection
-        self.proj = nn.Conv2d(img_channels, img_channels, kernel_size=1)
-        
-    def forward(self, img, params):
-        B, C, H, W = img.shape
-        
-        # Process image to create queries
-        img_norm = self.img_norm(img)
-        q = self.img_to_q(img_norm)
-        q = q.reshape(B * self.num_heads, C // self.num_heads, H * W)  # [B*nh, C/nh, H*W]
-        
-        # Process parameters to create keys and values
-        param_norm = self.param_norm(params)
-        kv = self.param_to_kv(param_norm)  # [B, img_channels*2]
-        k, v = kv.chunk(2, dim=1)
-        
-        # Reshape k, v for attention
-        k = k.unsqueeze(-1)  # [B, C, 1]
-        v = v.unsqueeze(-1)  # [B, C, 1]
-        
-        # Reshape for multi-head attention
-        k = k.reshape(B * self.num_heads, C // self.num_heads, 1)  # [B*nh, C/nh, 1]
-        v = v.reshape(B * self.num_heads, C // self.num_heads, 1)  # [B*nh, C/nh, 1]
-        
-        # Cross-attention
-        scale = 1. / math.sqrt(math.sqrt(C // self.num_heads))
-        attn = torch.einsum("bct,bcs->bts", q * scale, k * scale)  # [B*nh, H*W, 1]
-        attn = attn.softmax(dim=1)
-        
-        # Apply attention weights
-        h = torch.einsum("bts,bcs->bct", attn, v)  # [B*nh, C/nh, H*W]
-        h = h.reshape(B, C, H, W)
-        h = self.proj(h)
-        
-        return h + img  # Residual connection
-
-
-# Parameter Encoder MLP (no time embedding)
-class ParameterEncoder(nn.Module):
-    def __init__(self, param_dim, hidden_dim, out_dim):
-        super().__init__()
-        self.input_proj = nn.Linear(param_dim, hidden_dim)
-        
-        self.layers = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.SiLU(),
-                nn.Linear(hidden_dim, hidden_dim)
-            )
-            for _ in range(3)  # 3 layers of transformation
-        ])
-        
-        self.out_proj = nn.Linear(hidden_dim, out_dim)
-        
-    def forward(self, params):
-        # Embed parameters
-        h = self.input_proj(params)
-        
-        # Process through layers
-        for layer in self.layers:
-            h = layer(h) + h  # Residual connection
-            
-        return self.out_proj(h)
-
-
-# Sequential module for parameter passing
-class SequentialWithParams(nn.Sequential):
-    """
-    A sequential module that passes parameters to cross-modal attention blocks.
-    """
-
-    def forward(self, x, params=None):
-        for layer in self:
-            if isinstance(layer, CrossModalAttentionBlock) and params is not None:
-                x = layer(x, params)
-            else:
-                x = layer(x)
-        return x
-
-
-# upsample
-class Upsample(nn.Module):
-    def __init__(self, channels, use_conv):
-        super().__init__()
-        self.use_conv = use_conv
-        if use_conv:
-            self.conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-
-    def forward(self, x):
-        x = F.interpolate(x, scale_factor=2, mode="nearest")
-        if self.use_conv:
-            x = self.conv(x)
-        return x
-
-
-# downsample
 class Downsample(nn.Module):
     def __init__(self, channels, use_conv):
         super().__init__()
@@ -188,27 +50,188 @@ class Downsample(nn.Module):
     def forward(self, x):
         return self.op(x)
 
+# -------------------------
+# Attention Blocks (without timestep embedding)
+# -------------------------
+class AttentionBlock(nn.Module):
+	"""
+	Self-attention block where image attends to itself
+	"""
+	def __init__(self, channels, num_heads=1, dropout=0.1):
+		super().__init__()
+		self.num_heads = num_heads
+		assert channels % num_heads == 0
+		self.head_dim = channels // num_heads
+		self.attn_dropout = nn.Dropout(dropout)
+		
+		# Normalization and projection for image tokens
+		self.norm = nn.LayerNorm(channels)
+		self.to_qkv = nn.Linear(channels, channels * 3, bias=False)
+		self.out_proj = nn.Linear(channels, channels)
+	
+	def forward(self, img_tokens):
+		B, N, C = img_tokens.shape
+		
+		# Self-attention on image tokens
+		qkv = self.to_qkv(self.norm(img_tokens))
+		q, k, v = qkv.chunk(3, dim=2)
+		
+		# Reshape for multi-head attention
+		q = q.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+		k = k.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+		v = v.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+		
+		# Attention
+		scale = 1.0 / math.sqrt(self.head_dim)
+		attn = torch.softmax(torch.matmul(q, k.transpose(-2, -1)) * scale, dim=-1)
+		attn = self.attn_dropout(attn)
+		out = torch.matmul(attn, v)
+		
+		# Reshape back
+		out = out.transpose(1, 2).contiguous().view(B, N, C)
+		out = self.out_proj(out)
+		
+		return out + img_tokens
 
-# Property Prediction Encoder (Encoder-only architecture)
-class PropertyPredictionUNet(nn.Module):
+class CrossAttentionBlock(nn.Module):
+	"""
+	Cross-attention block where images attend to parameters
+	"""
+	def __init__(self, img_channels, param_dim, num_heads=1, dropout=0.1):
+		super().__init__()
+		self.num_heads = num_heads
+		self.param_dim = param_dim
+		assert img_channels % num_heads == 0
+		self.head_dim = img_channels // num_heads
+		self.attn_dropout = nn.Dropout(dropout)
+		
+		# Image token normalization and query projection
+		self.img_norm = nn.LayerNorm(img_channels)
+		self.to_q = nn.Linear(img_channels, img_channels, bias=False)
+		
+		# Parameter projection to match image channels
+		self.param_proj = nn.Linear(param_dim, img_channels)
+		
+		# Context normalization and key/value projection
+		self.context_norm = nn.LayerNorm(img_channels)
+		self.to_kv = nn.Linear(img_channels, 2 * img_channels, bias=False)
+		
+		self.out_proj = nn.Linear(img_channels, img_channels)
+	
+	def forward(self, img_tokens, param_tokens):
+		B, N_img, C = img_tokens.shape
+		
+		# Query from image tokens
+		q = self.to_q(self.img_norm(img_tokens))
+		
+		# Project parameters to match image channels
+		param_tokens_proj = self.param_proj(param_tokens)  # [B, param_dim] -> [B, C]
+		param_tokens_proj = param_tokens_proj.unsqueeze(1)  # [B, 1, C]
+		
+		# Context is just parameters (no objectives in predictor)
+		context = param_tokens_proj  # [B, 1, C]
+		
+		# Key/Value from context
+		kv = self.to_kv(self.context_norm(context))
+		k, v = kv.chunk(2, dim=2)
+		
+		# Expand context to match image sequence length for cross-attention
+		N_context = context.shape[1]
+		k = k.unsqueeze(2).expand(-1, -1, N_img, -1).reshape(B, N_context * N_img, C)
+		v = v.unsqueeze(2).expand(-1, -1, N_img, -1).reshape(B, N_context * N_img, C)
+		
+		# Reshape queries for multi-head attention
+		q = q.view(B, N_img, self.num_heads, self.head_dim).transpose(1, 2)
+		k = k.view(B, N_context * N_img, self.num_heads, self.head_dim).transpose(1, 2)
+		v = v.view(B, N_context * N_img, self.num_heads, self.head_dim).transpose(1, 2)
+		
+		# Cross-attention
+		scale = 1.0 / math.sqrt(self.head_dim)
+		attn = torch.softmax(torch.matmul(q, k.transpose(-2, -1)) * scale, dim=-1)
+		attn = self.attn_dropout(attn)
+		out = torch.matmul(attn, v)
+		
+		# Reshape back
+		out = out.transpose(1, 2).contiguous().view(B, N_img, C)
+		out = self.out_proj(out)
+		
+		return out + img_tokens
+
+# -------------------------
+# Parameter encoder (without time embedding)
+# -------------------------
+class ParameterEncoder(nn.Module):
+	def __init__(self, param_dim, hidden_dim, out_dim, residual_scale=0.1):
+		super().__init__()
+		self.residual_scale = residual_scale
+		self.input_proj = nn.Linear(param_dim, hidden_dim)
+		self.layers = nn.ModuleList([
+			nn.Sequential(
+				nn.Linear(hidden_dim, hidden_dim),
+				nn.SiLU(),
+				nn.Linear(hidden_dim, hidden_dim)
+			)
+			for _ in range(2)
+		])
+		self.out_proj = nn.Linear(hidden_dim, out_dim)
+	
+	def forward(self, params):
+		h = self.input_proj(params)
+		for layer in self.layers:
+			h = layer(h) + self.residual_scale*h
+		return self.out_proj(h)
+
+# -------------------------
+# Sequential container for predictor
+# -------------------------
+class PredictorSequential(nn.Sequential):
+    """
+    Sequential container that routes params through attention layers
+    """
+    def forward(self, x, params=None):
+        for layer in self:
+            if isinstance(layer, AttentionBlock):
+                # Convert image to tokens and apply self-attention
+                B, C, H, W = x.shape
+                img_tokens = x.reshape(B, C, H*W).permute(0, 2, 1)
+                img_tokens = layer(img_tokens)
+                x = img_tokens.permute(0, 2, 1).reshape(B, C, H, W)
+            elif isinstance(layer, CrossAttentionBlock):
+                # Convert image to tokens and apply cross-attention
+                B, C, H, W = x.shape
+                img_tokens = x.reshape(B, C, H*W).permute(0, 2, 1)
+                if params is not None:
+                    img_tokens = layer(img_tokens, params)
+                else:
+                    # fallback: zero param vector matching device and batch
+                    zero_params = torch.zeros(x.shape[0], layer.param_dim, device=x.device)
+                    img_tokens = layer(img_tokens, zero_params)
+                x = img_tokens.permute(0, 2, 1).reshape(B, C, H, W)
+            else:
+                x = layer(x)
+        return x
+
+# -------------------------
+# UNetPredictor definition
+# -------------------------
+class UNetPredictor(nn.Module):
     def __init__(
-        self,
-        in_channels=1,
-        model_channels=128,
-        param_dim=8,
-        param_hidden_dim=128,
-        obj_dim=1,  # dimension of properties to predict
-        num_res_blocks=2,
-        attention_resolutions=(8, 16),
-        dropout=0.1,
-        channel_mult=(1, 2, 2, 2),
-        conv_resample=True,
-        num_heads=4,
-        use_cross_attention=True,
-        global_pool='adaptive'  # 'adaptive', 'avg', or 'max'
+            self,
+            in_channels=1,
+            model_channels=64,
+            param_dim=7,
+            param_hidden_dim=64,
+            obj_dim=2,
+            num_res_blocks=2,
+            attention_resolutions=(8, 16),
+            dropout=0.1,
+            channel_mult=(1, 2, 2, 2),
+            conv_resample=True,
+            num_heads=4,
+            use_cross_attention=True
     ):
         super().__init__()
-    
+
         self.in_channels = in_channels
         self.model_channels = model_channels
         self.param_dim = param_dim
@@ -220,20 +243,17 @@ class PropertyPredictionUNet(nn.Module):
         self.conv_resample = conv_resample
         self.num_heads = num_heads
         self.use_cross_attention = use_cross_attention
-        self.global_pool = global_pool
-    
-        # Parameter encoder
+
+        # Parameter encoder (no time embedding)
         self.param_encoder = ParameterEncoder(
             param_dim=param_dim,
             hidden_dim=param_hidden_dim,
             out_dim=param_hidden_dim
         )
-        
-        #### encoder path only ####
-        
+
         # down blocks
-        self.encoder_blocks = nn.ModuleList([
-            SequentialWithParams(nn.Conv2d(in_channels, model_channels, kernel_size=3, padding=1))
+        self.down_blocks = nn.ModuleList([
+            PredictorSequential(nn.Conv2d(in_channels, model_channels, kernel_size=3, padding=1))
         ])
         ch = model_channels
         ds = 1
@@ -245,91 +265,71 @@ class PropertyPredictionUNet(nn.Module):
                 ]
                 ch = mult * model_channels
                 if ds in attention_resolutions:
-                    # Add self-attention to images
-                    layers.append(AttentionBlock(ch, num_heads=num_heads))
-                    
-                    # Add cross-attention between image and parameter modalities
+                    # Self-attention for images
+                    layers.append(AttentionBlock(ch, num_heads, dropout))
+
+                    # Cross-attention between images and parameters
                     if self.use_cross_attention:
-                        layers.append(CrossModalAttentionBlock(ch, param_hidden_dim, num_heads=num_heads))
-                        
-                self.encoder_blocks.append(SequentialWithParams(*layers))
+                        layers.append(CrossAttentionBlock(ch, param_hidden_dim, num_heads, dropout))
+
+                self.down_blocks.append(PredictorSequential(*layers))
                 
             if level != len(channel_mult) - 1:
-                self.encoder_blocks.append(SequentialWithParams(Downsample(ch, conv_resample)))
+                self.down_blocks.append(PredictorSequential(Downsample(ch, conv_resample)))
                 ds *= 2
-    
-        # bottleneck block
-        bottleneck_layers = [
+
+        # middle block
+        middle_layers = [
             ResidualBlock(ch, ch, dropout),
-            AttentionBlock(ch, num_heads=num_heads)
+            ResidualBlock(ch, ch, dropout),
+            AttentionBlock(ch, num_heads, dropout)
         ]
-        
-        # Add a cross-attention block at the bottleneck
+
+        # Add cross-attention block at bottleneck
         if self.use_cross_attention:
-            bottleneck_layers.append(CrossModalAttentionBlock(ch, param_hidden_dim, num_heads=num_heads))
-            
-        bottleneck_layers.append(ResidualBlock(ch, ch, dropout))
+            middle_layers.append(CrossAttentionBlock(ch, param_hidden_dim, num_heads, dropout))
+
+        self.middle_block = PredictorSequential(*middle_layers)
+
+        # Global average pooling and objective prediction head
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
         
-        self.bottleneck_block = SequentialWithParams(*bottleneck_layers)
-        
-        # Store final channel dimension for fusion
-        self.final_channels = ch
-    
-        #### Feature fusion and prediction head ####
-        
-        # Global pooling layer for image features
-        if global_pool == 'adaptive':
-            self.global_pool_layer = nn.AdaptiveAvgPool2d(1)
-        elif global_pool == 'avg':
-            self.global_pool_layer = nn.AdaptiveAvgPool2d(1)
-        elif global_pool == 'max':
-            self.global_pool_layer = nn.AdaptiveMaxPool2d(1)
-        else:
-            raise ValueError(f"Unsupported global_pool: {global_pool}")
-        
-        # Feature fusion layer
-        combined_dim = self.final_channels + param_hidden_dim
-        self.fusion_layers = nn.Sequential(
-            nn.Linear(combined_dim, combined_dim),
+        # Combine image features with parameter features for final prediction
+        self.obj_predictor = nn.Sequential(
+            nn.Linear(ch + param_hidden_dim, ch),
             nn.SiLU(),
             nn.Dropout(dropout),
-            nn.Linear(combined_dim, combined_dim // 2),
+            nn.Linear(ch, ch // 2),
             nn.SiLU(),
             nn.Dropout(dropout),
+            nn.Linear(ch // 2, obj_dim)
         )
-        
-        # Property prediction head
-        self.property_head = nn.Linear(combined_dim // 2, obj_dim)
-    
+
     def forward(self, x, params):
         """
-        Apply the model to predict properties from images and parameters.
-        :param x: an [N x C x H x W] Tensor of image inputs.
-        :param params: an [N x param_dim] Tensor of parameter inputs.
-        :return: an [N x obj_dim] Tensor of predicted properties.
+        :param x: [N, C, H, W] - input images
+        :param params: [N, param_dim] - input parameters
+        :return: objectives [N, obj_dim] - predicted objectives
         """
+        
         # Process parameters
-        param_features = self.param_encoder(params)
-        
-        # Encoder stage for image
+        param_features = self.param_encoder(params)  # [B, param_hidden_dim]
+
+        # Down stage
         h = x
-        for module in self.encoder_blocks:
+        for module in self.down_blocks:
             h = module(h, param_features)
-            
-        # Bottleneck stage
-        h = self.bottleneck_block(h, param_features)
-        
-        # Global pooling of image features
-        # h: [N, C, H, W] -> [N, C, 1, 1] -> [N, C]
-        img_global = self.global_pool_layer(h).squeeze(-1).squeeze(-1)
+
+        # Middle
+        h = self.middle_block(h, param_features)
+
+        # Global pooling to get image features
+        img_features = self.global_pool(h).squeeze(-1).squeeze(-1)  # [B, ch]
         
         # Combine image and parameter features
-        combined_features = torch.cat([img_global, param_features], dim=1)
+        combined_features = torch.cat([img_features, param_features], dim=1)  # [B, ch + param_hidden_dim]
         
-        # Feature fusion
-        fused_features = self.fusion_layers(combined_features)
+        # Predict objectives
+        objectives = self.obj_predictor(combined_features)  # [B, obj_dim]
         
-        # Predict properties
-        properties = self.property_head(fused_features)
-        
-        return properties
+        return objectives
