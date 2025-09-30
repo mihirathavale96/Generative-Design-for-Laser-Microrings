@@ -22,8 +22,10 @@ def train(config):
 	
 	device = torch.device(config["device"])
 	loader, param_scaler, prop_scaler = create_dataset(**config["Dataset"])
-	joblib.dump(param_scaler, 'checkpoint/param_scaler.pkl')
 	start_epoch = 1
+
+	joblib.dump(param_scaler, 'checkpoint/param_scaler.pkl')
+	joblib.dump(prop_scaler, 'checkpoint/prop_scaler.pkl')
 	
 	model = UNet(**config["Model"]).to(device)
 	optimizer = torch.optim.AdamW(model.parameters(), lr=config["lr"], weight_decay=1e-4)
@@ -43,9 +45,6 @@ def train(config):
 							  optimizer=optimizer.state_dict(), start_epoch=epoch,
 							  model_checkpoint=model_checkpoint.state_dict())
 	
-	joblib.dump(param_scaler, 'checkpoint/param_scaler.pkl')
-	joblib.dump(prop_scaler, 'checkpoint/prop_scaler.pkl')
-
 
 if __name__ == "__main__":
     config = load_yaml("config.yml", encoding="utf-8")

@@ -23,7 +23,7 @@ def parse_option():
 	parser.add_argument("--sampler", type=str, default="ddim", choices=["ddpm", "ddim"])
 	
 	# generator param
-	parser.add_argument("-bs", "--batch_size", type=int, default=1024)
+	parser.add_argument("-bs", "--batch_size", type=int, default=512)
 	parser.add_argument("-mbs", "--max_batch_size", type=int, default=128)
 
 	# DDIM sampler param
@@ -31,13 +31,13 @@ def parse_option():
 	parser.add_argument("--steps", type=int, default=100)
 	parser.add_argument("--method", type=str, default="linear", choices=["linear", "quadratic"])
 
-	parser.add_argument("--target", type=int, default=3.6)
-	parser.add_argument("--cfg", type=int, default=5.0)
+	parser.add_argument("--target", type=list, default=[-2.0, 1.6])
+	parser.add_argument("--cfg", type=int, default=9.0)
 
 	# save param
 	# these determine if you want a progress of the images
-	parser.add_argument("--result_only", default=False, action="store_true")
-	parser.add_argument("--interval", type=int, default=50)
+	parser.add_argument("--result_only", default=True, action="store_true")
+	parser.add_argument("--interval", type=int, default=20)
 	
 	parser.add_argument("--nrow", type=int, default=4)
 	parser.add_argument("-sp", "--save_path", type=str, default="results/")
@@ -58,8 +58,7 @@ def save_sample_image(images: torch.Tensor, result_only, nrow, label, **kwargs):
 		concat image, a tensor with shape (height, width, channels).
 	"""
 	if result_only:
-		#nrow = nrow
-		nrow = images.shape[1]
+		nrow = nrow
 	else:
 		nrow = images.shape[1]
 	
@@ -115,8 +114,7 @@ def generate(args):
 			extra_param = dict(steps=args.steps, eta=args.eta, method=args.method)
 			
 			target_objs = create_target_objectives(
-				batch_size=vec_length, target_value=args.target,
-				obj_dim=cp["config"]["Model"]["obj_dim"], device='cuda')
+				batch_size=vec_length, target_value=args.target, device=device)
 
 			images_chunk, params_chunk = sampler(
 				z_t, z_params, only_return_x_0=args.result_only, interval=args.interval, 
@@ -133,11 +131,13 @@ def generate(args):
 		z_t = torch.randn(
 			(args.batch_size, cp["config"]["Model"]["in_channels"], *cp["config"]["Dataset"]["image_size"]),
 			device=device)
-		z_params = torch.randn((args.batch_size, cp["config"]["Dataset"]["param_dim"]),
-							   obj_dim=cp["config"]["Model"]["obj_dim"], device=device)
+		z_params = torch.randn(
+			(args.batch_size, cp["config"]["Dataset"]["param_dim"]),
+			#obj_dim=cp["config"]["Model"]["obj_dim"],
+			device=device)
 		extra_param = dict(steps=args.steps, eta=args.eta, method=args.method)
 		target_objs = create_target_objectives(
-			batch_size=args.batch_size, target_value=args.target, device='cuda')
+			batch_size=args.batch_size, target_value=args.target, device=device)
 
 		images, params = sampler(
 			z_t, z_params, only_return_x_0=args.result_only, interval=args.interval, 
@@ -158,10 +158,10 @@ def generate(args):
 	label = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M')
 
 	save_sample_image(images, result_only=args.result_only, nrow=args.nrow, label=label)
-	torch.save(images[:, -1, :, :, :], args.save_path+"images_raw_"+label)
+	torch.save(images, args.save_path+"images_raw_"+label)
 	np.savetxt(args.save_path+"params_"+label+".csv", params, delimiter=",", fmt='%f',
 			   header=
-			   "diameter, pitch, height, nQWs, growth_Temp_QW,growth_AsP_QW, growth_InP_barrier, growth_time_cap",
+			   "diameter, pitch, nQWs, growth_Temp_QW,growth_AsP_QW, growth_InP_barrier, growth_time_cap",
 			  )
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@ import sys
 sys.path.append('.')
 
 from dataset import create_dataset
-from model.UNetPredictor import PropertyPredictionUNet
+from model.UNetPredictor import UNetPredictor
 from utils.engine import PropertyPredictionTrainer
 from utils.tools import train_one_epoch, load_yaml
 
@@ -23,8 +23,11 @@ def train(config):
 	device = torch.device(config["device"])
 	loader, param_scaler, prop_scaler = create_dataset(**config["Dataset"])
 	start_epoch = 1
+
+	joblib.dump(param_scaler, 'predictor/param_scaler.pkl')
+	joblib.dump(prop_scaler, 'predictor/prop_scaler.pkl')
 	
-	model = PropertyPredictionUNet(**config["ModelPredictor"]).to(device)
+	model = UNetPredictor(**config["ModelPredictor"]).to(device)
 	optimizer = torch.optim.AdamW(model.parameters(), lr=config["lr"], weight_decay=1e-4)
 	trainer = PropertyPredictionTrainer(model).to(device)
 	
@@ -42,9 +45,6 @@ def train(config):
 							  optimizer=optimizer.state_dict(), start_epoch=epoch,
 							  model_checkpoint=model_checkpoint.state_dict())
 	
-	joblib.dump(param_scaler, 'predictor/param_scaler.pkl')
-	joblib.dump(prop_scaler, 'predictor/prop_scaler.pkl')
-
 
 if __name__ == "__main__":
     config = load_yaml("config.yml", encoding="utf-8")
