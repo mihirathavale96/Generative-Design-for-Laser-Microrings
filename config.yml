@@ -1,4 +1,4 @@
-### model params
+### Model params
 Model:
   in_channels: 1
   out_channels: 1
@@ -13,7 +13,6 @@ Model:
   channel_mult: [1, 2, 2, 2]
   conv_resample: True
   num_heads: 4
-
 ModelPredictor:
   in_channels: 1
   model_channels: 64
@@ -29,43 +28,33 @@ ModelPredictor:
 
 ### dataset params
 Dataset:
-  # parameters for torch.utils.data.DataLoader
-  batch_size: 64
+  batch_size: 10 # Changed for Colab original batch size was 64
   shuffle: True
   drop_last: True
   pin_memory: True
-  num_workers: 4
-  image_size: [ 128, 128 ]
+  num_workers: 0    # Set to 0 for Colab to avoid fork errors; use 4+ for CSF3
+  image_size: [128, 128]
   param_dim: 8
-  # The save path for data.
-  datafilepath: "./dataset/batch_1_diff_corr_1.pkl"
+  ### The save path for data.
+  datafilepath: placeholder  # Overridden by --datafilepath (e.g., /content/drive/MyDrive/... or /scratch/your_user/...)
 
 ### trainer params
 Trainer:
-  # sample time steps
   T: 1000
   beta: [0.0001, 0.02]
 
-
 ### callback params
 Callback:
-  # The save path for checkpoint.
-  filepath: "./checkpoint/unet.pth"
-  # Frequency of checkpoint saving.
+  filepath: placeholder  # Overridden by --checkpoint_dir (e.g., /content/drive/MyDrive/checkpoints/unet.pth)
+  save_freq: 1
+CallbackPredictor:
+  filepath: placeholder  # Overridden by --predictor_checkpoint_dir (e.g., /content/drive/MyDrive/predictor/unet.pth)
   save_freq: 1
 
 ### callback params
-CallbackPredictor:
-  # The save path for checkpoint.
-  filepath: "./predictor/unet.pth"
-  # Frequency of checkpoint saving.
-  save_freq: 1
-
-
-### train params
-device: "cuda"
-epochs: 700
-predictor_epochs: 700
+device: cuda  # Set to 'cpu' for CPU jobs; 'cuda' for Colab GPU
+epochs: 700  # Set to 1 for testing; increase for full training (700)
+predictor_epochs: 700 # Set to 1 for testing; increase for full training (700)
 # Whether to continue training, True or False
 consume: False
 # If continue training, which checkpoint to load
@@ -73,3 +62,8 @@ consume: False
 
 ### optimizer params
 lr: 0.0002
+# Notes:
+# - Use train.py with --datafilepath, --checkpoint_dir, --predictor_checkpoint_dir
+# - Colab: Enable GPU runtime; set num_workers: 0 if fork errors
+# - Batch size: Chnaged it to 10 from 64 to smoothly run in colab GPU
+# - CSF3: Load modules (module load python/3.12 cuda/12.6); use SLURM
