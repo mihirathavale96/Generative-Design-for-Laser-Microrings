@@ -1,6 +1,7 @@
 import torch
 import math
-from pathlib2 import Path
+#from pathlib2 import Path
+from pathlib import Path
 from typing import Union, Dict
 
 
