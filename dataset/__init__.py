@@ -1,6 +1,7 @@
 import torch
 from torch.utils.data import DataLoader, Dataset
-from pathlib2 import Path, Iterable
+#from pathlib2 import Path, Iterable
+from pathlib import Path
 from typing import Union, Iterable
 import pandas as pd
 import numpy as np
