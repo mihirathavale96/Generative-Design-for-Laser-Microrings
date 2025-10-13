@@ -4,7 +4,8 @@ from tqdm import tqdm
 from torchvision.utils import make_grid
 from torchvision import transforms
 from PIL import Image
-from pathlib2 import Path
+#from pathlib2 import Path
+from pathlib import Path
 import yaml
 
 
